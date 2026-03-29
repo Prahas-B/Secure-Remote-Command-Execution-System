@@ -6,6 +6,8 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <signal.h>
+#include <time.h>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -14,7 +16,25 @@
 #define SERV_PORT 8080
 #define LISTENQ 10
 
-/* -------- Authentication Function -------- */
+/* -------- AUDIT LOG FUNCTION -------- */
+
+void log_event(const char *event, const char *client_ip)
+{
+    FILE *log = fopen("audit.log", "a");
+
+    if(log == NULL)
+        return;
+
+    time_t now = time(NULL);
+    char *time_str = ctime(&now);
+    time_str[strlen(time_str) - 1] = '\0'; // remove newline
+
+    fprintf(log, "[%s] [%s] %s\n", time_str, client_ip, event);
+
+    fclose(log);
+}
+
+/* -------- AUTHENTICATION -------- */
 
 int authenticate(char *username, char *password)
 {
@@ -39,9 +59,9 @@ int authenticate(char *username, char *password)
     return 0;
 }
 
-/* -------- Client Handler -------- */
+/* -------- CLIENT HANDLER -------- */
 
-void handle_client(SSL *ssl)
+void handle_client(SSL *ssl, char *client_ip)
 {
     char recvline[MAXLINE];
     char sendline[MAXLINE];
@@ -51,15 +71,17 @@ void handle_client(SSL *ssl)
 
     int authenticated = 0;
 
-    /* -------- LOGIN PHASE -------- */
+    /* LOGIN */
 
     bzero(recvline, MAXLINE);
 
-    SSL_read(ssl, recvline, MAXLINE);
+    if(SSL_read(ssl, recvline, MAXLINE) <= 0)
+        return;
 
     if(sscanf(recvline,"LOGIN %s %s",username,password) != 2)
     {
         SSL_write(ssl,"Invalid LOGIN format\n",21);
+        log_event("Invalid LOGIN format", client_ip);
         return;
     }
 
@@ -67,16 +89,25 @@ void handle_client(SSL *ssl)
     {
         authenticated = 1;
         SSL_write(ssl,"Authentication Successful\n",26);
+
+        char logmsg[200];
+        sprintf(logmsg,"Login success: %s", username);
+        log_event(logmsg, client_ip);
+
         printf("User %s logged in\n",username);
     }
     else
     {
         SSL_write(ssl,"Authentication Failed\n",22);
-        printf("Login failed for %s\n",username);
+
+        char logmsg[200];
+        sprintf(logmsg,"Login failed: %s", username);
+        log_event(logmsg, client_ip);
+
         return;
     }
 
-    /* -------- COMMAND LOOP -------- */
+    /* COMMAND LOOP */
 
     while(authenticated)
     {
@@ -89,7 +120,7 @@ void handle_client(SSL *ssl)
 
         if(strncmp(recvline,"EXIT",4)==0)
         {
-            printf("Client disconnected\n");
+            log_event("Client exited", client_ip);
             break;
         }
 
@@ -99,6 +130,10 @@ void handle_client(SSL *ssl)
 
             sscanf(recvline,"CMD %[^\n]",command);
 
+            char logmsg[300];
+            sprintf(logmsg,"Command executed: %s", command);
+            log_event(logmsg, client_ip);
+
             FILE *fp = popen(command,"r");
 
             if(fp == NULL)
@@ -107,11 +142,11 @@ void handle_client(SSL *ssl)
                 continue;
             }
 
-            bzero(sendline,MAXLINE);
-
-            fread(sendline,1,MAXLINE-1,fp);
-
-            SSL_write(ssl,sendline,strlen(sendline));
+            /* send full output */
+            while(fgets(sendline, MAXLINE, fp) != NULL)
+            {
+                SSL_write(ssl, sendline, strlen(sendline));
+            }
 
             pclose(fp);
         }
@@ -122,7 +157,7 @@ void handle_client(SSL *ssl)
     }
 }
 
-/* -------- MAIN SERVER -------- */
+/* -------- MAIN -------- */
 
 int main()
 {
@@ -135,8 +170,10 @@ int main()
     SSL_CTX *ctx;
     SSL *ssl;
 
-    /* SSL Initialization */
+    /* Prevent zombies */
+    signal(SIGCHLD, SIG_IGN);
 
+    /* SSL INIT */
     SSL_library_init();
     OpenSSL_add_all_algorithms();
     SSL_load_error_strings();
@@ -152,8 +189,7 @@ int main()
     SSL_CTX_use_certificate_file(ctx,"server.crt",SSL_FILETYPE_PEM);
     SSL_CTX_use_PrivateKey_file(ctx,"server.key",SSL_FILETYPE_PEM);
 
-    /* Create socket */
-
+    /* SOCKET */
     listenfd = socket(AF_INET,SOCK_STREAM,0);
 
     bzero(&servaddr,sizeof(servaddr));
@@ -163,7 +199,6 @@ int main()
     servaddr.sin_port = htons(SERV_PORT);
 
     bind(listenfd,(struct sockaddr *)&servaddr,sizeof(servaddr));
-
     listen(listenfd,LISTENQ);
 
     printf("Secure Server running on port %d...\n",SERV_PORT);
@@ -173,6 +208,8 @@ int main()
         clilen = sizeof(cliaddr);
 
         connfd = accept(listenfd,(struct sockaddr *)&cliaddr,&clilen);
+
+        char *client_ip = inet_ntoa(cliaddr.sin_addr);
 
         if((childpid = fork()) == 0)
         {
@@ -187,13 +224,15 @@ int main()
             }
             else
             {
-                printf("SSL connection established\n");
-                handle_client(ssl);
+                printf("SSL connection established with %s\n", client_ip);
+
+                log_event("New connection established", client_ip);
+
+                handle_client(ssl, client_ip);
             }
 
             SSL_shutdown(ssl);
             SSL_free(ssl);
-
             close(connfd);
 
             exit(0);
